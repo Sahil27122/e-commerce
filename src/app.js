@@ -2,6 +2,7 @@
 const express = require('express')
 
 const authRoutes = require('./routes/auth.routes');
+
 const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
@@ -15,7 +16,7 @@ app.get('/health' , (req, res) => {
 
 app.use('/auth', authRoutes)
 
-app.use(errorHandler)
+app.use(errorHandler) // after all routes
 
 // Export the app
 module.exports = app

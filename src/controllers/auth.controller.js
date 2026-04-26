@@ -1,7 +1,7 @@
 const asyncHandler = require('../utils/asyncHandler') 
 // No try/catch anywhere - asyncHandler wraps every controller function - automatically forwards any error to next()
 
-const authService = require('../services/auth.service')
+const authService = require('../services/auth.service');
 
 // const register = async (req, res) => {
 //     try {
@@ -24,4 +24,10 @@ const register = asyncHandler(async (req, res) => {
     res.status(201).json({success: true, data: result});
 })
 
-module.exports = { register }
+const login = asyncHandler(async (req, res) => {
+    const {email, password} = req.body;
+    const result = await authService.login(email, password);
+    res.status(200).json({success: true, data: result});
+})
+
+module.exports = { register, login }

@@ -27,4 +27,14 @@ model User {
   role       Role     @default(CUSTOMER)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+  refreshTokens RefreshToken[]
+}
+
+model RefreshToken {
+  id         String @id @default(uuid())
+  token      String @unique
+  userId     String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user User@relation(fields: [userId], references: [id])
 }
