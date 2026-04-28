@@ -1,33 +1,85 @@
 const asyncHandler = require('../utils/asyncHandler') 
 // No try/catch anywhere - asyncHandler wraps every controller function - automatically forwards any error to next()
 
+const AppError = require('../utils/AppError')
+
 const authService = require('../services/auth.service');
-
-// const register = async (req, res) => {
-//     try {
-//         // 1. get name, email, password from req.body - take input
-//         const { name, email, password } = req.body;
-
-//         // 2. call authService.register() with that data - hand to service
-//         const result = await authService.register(name, email, password)
-
-//         // 3. return res.json with success message
-           // res.json({ success: true, data: result})
-//     }catch(err){
-//         next(err) // passes error to global handler
-//     }
-// }
+const { success } = require('zod');
 
 const register = asyncHandler(async (req, res) => {
     const {name, email, password} = req.body;
     const result = await authService.register(name, email, password);
-    res.status(201).json({success: true, data: result});
+    res.status(201).json({
+        success: true, 
+        data: result
+    });
 })
 
 const login = asyncHandler(async (req, res) => {
     const {email, password} = req.body;
     const result = await authService.login(email, password);
-    res.status(200).json({success: true, data: result});
+    
+    // Set refresh token as HTTP-only cookie
+    res.cookie('refreshToken', result.refreshToken, {
+        httpOnly: true,  // Js can't access this
+        secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+        sameSite: 'strict',  // CSRF protection
+        maxAge: 7 * 24 * 60 * 60 * 1000
+    })
+
+    
+    res.status(200).json({
+        success: true, 
+        data: {accessToken : result.accessToken}
+    });
 })
 
-module.exports = { register, login }
+const me = asyncHandler(async (req, res) => {
+    const user = await authService.getMe(req.user.userId)
+    res.status(200).json({
+        success: true,
+        data: user
+    })
+})
+
+const refresh = asyncHandler(async (req, res) => {
+    
+    const rawToken = req.cookies.refreshToken
+
+    if (!rawToken) {
+        throw new AppError('No refresh token provided', 401)
+    }
+
+    const result = await authService.refreshAccessToken(rawToken)
+
+    res.cookie('refreshToken', result.refreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+    })
+
+    res.status(200).json({
+        success: true,
+        data: {accessToken : result.accessToken}
+    })
+})
+
+const logout = asyncHandler(async (req, res) => {
+    
+    const rawToken = req.cookies.refreshToken
+
+    if(!rawToken){
+        throw new AppError('No refresh token provided', 401)
+    }
+
+    await authService.logout(rawToken)
+
+    res.clearCookie('refreshToken')
+
+    res.status(200).json({
+        success: true
+    })
+})
+
+module.exports = { register, login, me, refresh, logout }

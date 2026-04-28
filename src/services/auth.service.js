@@ -1,24 +1,24 @@
 const prisma = require('../config/db')
 const bcrypt = require('bcrypt')
 
+const crypto = require('crypto')
+
 const AppError = require('../utils/AppError')
 
 const {generateAccessToken, generateRefreshToken} = require('../utils/tokenUtils')
+const { id } = require('zod/locales')
 
 const register = async(name, email, password) => {
-    // Step 1: Check if email already exists
+    
     const existingUser = await prisma.user.findUnique({where:{email}})
 
-    // Step 2: If exists, throw AppError (409)
     if(existingUser){
         throw new AppError('Email already registered', 409)
     }
-    
-    // Step 3: Hash password (saltRounds = 10)
+
     const saltRounds = 10
     const hashedPassword = await bcrypt.hash(password, saltRounds)
-    
-    // Step 4: Create user in DB
+
     const user = await prisma.user.create({
         data:{
             name,
@@ -26,50 +26,130 @@ const register = async(name, email, password) => {
             password: hashedPassword
         }
     })
-    
-    // Step 5: Remove password and return user
+   
     const{password: _, ...userWithoutPassword} = user
 
-    // return result
     return userWithoutPassword
 }
 
 const login = async(email, password) => {
-    // Step 1: Find user by email
+    
     const user = await prisma.user.findUnique({where: {email}})
 
-    // if not found → throw AppError('Invalid credentials', 401)
     if(!user){
         throw new AppError('Invalid credentials', 401)
     }
 
-    // Step 2: Compare password with bcrypt.compare()
     const isMatch = await bcrypt.compare(password, user.password)
     
-    // if wrong → throw AppError('Invalid credentials', 401)
     if(!isMatch){
         throw new AppError('Invalid credentials', 401)
     }
 
-    // Step 3: Generate access token and refresh token
     const accessToken = generateAccessToken(user.id, user.role);
     const newRefreshToken = generateRefreshToken(user.id);
+
+    const hashedToken = crypto
+    .createHash('sha256')
+    .update(newRefreshToken)
+    .digest('hex')
+
+
+    
 
     // expiresAt = 7 days from now
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
 
-    // Step 4: Store refresh token in DB with expiry
-    // hint: prisma.refreshToken.create()
     const refreshToken = await prisma.refreshToken.create({
         data:{
-            token : newRefreshToken,
+            token : hashedToken, // hsahed version
             userId : user.id,
             expiresAt: expiresAt
         }
     })
 
-    // Step 5: Return both tokens
     return {accessToken, refreshToken: newRefreshToken}
 }
 
-module.exports = {register, login}
+const getMe = async (userId) => {
+    const user = await prisma.user.findUnique({
+        where: {id: userId},
+        select: {
+            id:true,
+            name: true,
+            email: true,
+            role: true,
+            isVerified: true,
+            createdAt: true
+        }
+    })
+
+    if(!user) throw new AppError('User not found', 404)
+
+    return user
+}
+
+
+const refreshAccessToken = async (rawToken) => {
+    
+    const hashedToken = crypto
+    .createHash('sha256')
+    .update(rawToken)
+    .digest('hex')
+
+    const tokenRecord = await prisma.refreshToken.findUnique({ where: {token: hashedToken}})
+
+    if(!tokenRecord){
+        throw new AppError('Invalid refrsh token', 401)
+    }
+
+    if(tokenRecord.expiresAt < new Date()){
+        throw new AppError('Refresh token expired', 401)
+    }
+
+    // need the user's role - fetch user from DB or include in findUnique
+    const user = await prisma.user.findUnique({where: {id: tokenRecord.userId}})
+    
+    const accessToken = generateAccessToken(user.id, user.role);
+    
+    await prisma.refreshToken.delete({where: {id : tokenRecord.id}})
+
+    const newRefreshToken = generateRefreshToken(user.id);
+
+    const hashedRefresh = crypto
+    .createHash('sha256')
+    .update(newRefreshToken)
+    .digest('hex')
+
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
+    const refreshToken = await prisma.refreshToken.create({
+        data: {
+            token : hashedRefresh,
+            userId : user.id,
+            expiresAt : expiresAt
+        }
+    })
+
+    return {accessToken, refreshToken: newRefreshToken}
+}
+
+const logout = async (rawToken) => {
+    
+    const hashedToken = crypto
+    .createHash('sha256')
+    .update(rawToken)
+    .digest('hex')
+
+    const tokenRecord = await prisma.refreshToken.findUnique({where: {token: hashedToken}})
+
+    if(!tokenRecord){
+        throw new AppError('Invalid token', 401)
+    }
+
+    await prisma.refreshToken.delete({where: {id: tokenRecord.id}})
+
+    
+}
+
+module.exports = {register, login, getMe, refreshAccessToken, logout}

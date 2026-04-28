@@ -1,9 +1,8 @@
 const {PrismaClient} = require('@prisma/client')
 
-// create the instance here
+// instance
 const prisma = new PrismaClient()
 
-// export it
 module.exports = prisma
 
 
