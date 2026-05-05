@@ -53,8 +53,6 @@ const login = async(email, password) => {
     .createHash('sha256')
     .update(newRefreshToken)
     .digest('hex')
-
-
     
 
     // expiresAt = 7 days from now

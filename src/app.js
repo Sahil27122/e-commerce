@@ -8,7 +8,6 @@ const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
 
-// Add Json middleware (so we can read request bodies)
 app.use(express.json())
 
 app.use(cookieParser())

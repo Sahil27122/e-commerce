@@ -4,7 +4,6 @@ const asyncHandler = require('../utils/asyncHandler')
 
 const protect = asyncHandler(async (req, res, next) => {
    
-    // header looks like: "Bearer eyJhbG..."
     const authHeader = req.headers.authorization
 
     if(!authHeader || !authHeader.startsWith('Bearer ')){
@@ -13,7 +12,7 @@ const protect = asyncHandler(async (req, res, next) => {
 
     const token = authHeader.split(' ')[1]
 
-    // jwt.verify(token, secret) → returns payload or throws error
+    // jwt.verify(token, secret) -> returns payload or throws error
     // MATCH    -> returns decoded payload { userId, role }
     // NO MATCH -> throws JsonWebTokenError
     // EXPIRED  -> throws TokenExpiredError
