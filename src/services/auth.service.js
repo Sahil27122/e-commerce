@@ -1,4 +1,4 @@
-const prisma = require('../config/db')
+const prisma = require('../config/prisma')
 const bcrypt = require('bcrypt')
 
 const crypto = require('crypto')

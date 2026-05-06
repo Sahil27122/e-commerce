@@ -4,6 +4,8 @@ const cookieParser = require('cookie-parser')
 
 const authRoutes = require('./routes/auth.routes');
 
+const productRoutes = require('./routes/product.routes')
+
 const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
@@ -17,6 +19,8 @@ app.get('/health' , (req, res) => {
 })
 
 app.use('/auth', authRoutes)
+
+app.use('/products', productRoutes)
 
 app.use(errorHandler) // after all routes
 

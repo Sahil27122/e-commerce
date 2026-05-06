@@ -449,8 +449,8 @@ ecommerce-backend/
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/ecommerce-backend.git
-cd ecommerce-backend
+git clone https://github.com/Sahil27122/e-commerce.git
+cd e-commerce
 ```
 
 ### 2. Install dependencies

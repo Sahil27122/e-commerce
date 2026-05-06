@@ -5,8 +5,7 @@ const prisma = new PrismaClient()
 
 module.exports = prisma
 
-
-// New version
+// New version connecting prisma
 
 // import {PrismaClient } from '@prisma/client'
 // import {prismaPg} from '@prisma/adapter-pg'
