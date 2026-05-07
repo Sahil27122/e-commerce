@@ -10,4 +10,12 @@ const productController = require('../controllers/product.controller')
 
 router.post('/', protect, authorize('ADMIN'), productController.createProduct)
 
+router.get('/', productController.getProducts)
+
+router.get('/:slug', productController.getProductBySlug)
+
+router.put('/:id', protect, authorize('ADMIN'), productController.updateProduct)
+
+router.delete('/:id', protect, authorize('ADMIN'), productController.deleteProduct)
+
 module.exports = router
