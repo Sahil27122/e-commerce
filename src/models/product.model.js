@@ -25,7 +25,8 @@ const productSchema = new mongoose.Schema({
         type: [String]
     },
     category: {
-        type: String,
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Category',
         required: true
     },
     attributes: {
@@ -38,17 +39,8 @@ const productSchema = new mongoose.Schema({
 
 }, {timestamps: true})
 
-productSchema.pre('save', async function() {
-    if (this.isModified('name')) {
-        this.slug = this.name
-            .toLowerCase()
-            .trim()                     // remove leading/trailing spaces first
-            .replace(/\s+/g, '-')       // one or more spaces -> single hyphen
-            .replace(/[^\w-]+/g, '')    // remove special characters
-            .replace(/--+/g, '-')       // multiple hyphens -> single hyphen
-            .replace(/^-+|-+$/g, '')    // remove leading/trailing hyphens
-    }
-})
+productSchema.index({ isActive: 1, category: 1, price: 1 })
+productSchema.index({ isActive: 1, category: 1 })
 
 const Product = mongoose.model('Product', productSchema)
 

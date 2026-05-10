@@ -1,32 +1,44 @@
 const Product = require('../models/product.model')
 const AppError = require('../utils/AppError')
 
+const slugify = require('../utils/slugify')
+
+const cloudinary = require('../config/cloudinary')
+
 const createProduct = async (productData) => {
 
-    const { name, description, price, quantity, images, category, attributes } = productData
+    // generate slug for product
+    productData.slug = slugify(productData.name)
 
-    const product = await new Product({
+    const { name, description, price, quantity, images, category, slug, attributes } = productData
+
+    const product = await Product.create({
         name,
         description,
         price,
         quantity,
         images,
         category,
+        slug,
         attributes
-    }).save()
+    })
 
     return product
 }
 
 const getProducts = async (filters) => {
 
-    const { category, minPrice, maxPrice, page = 1, limit = 10 } = filters
+    const { category, search, minPrice, maxPrice, page = 1, limit = 10 } = filters
 
     // build query object dynamically
     const query = { isActive: true }
 
     if(category){
         query.category = category
+    }
+
+    if (search) {
+        query.name = { $regex: search, $options: 'i' }
     }
 
     if(minPrice || maxPrice){
@@ -44,7 +56,7 @@ const getProducts = async (filters) => {
     const skip = (page - 1) * limit
 
     const [products, total] = await Promise.all([
-        Product.find(query).skip(skip).limit(Number(limit)),
+        Product.find(query).populate('category', 'name slug').skip(skip).limit(Number(limit)),
         Product.countDocuments(query)
     ])
 
@@ -62,9 +74,7 @@ const getProducts = async (filters) => {
 
 const getProductBySlug = async (slug) => {
 
-    const product = await Product.findOne({
-        slug
-    })
+    const product = await Product.findOne({ slug }).populate('category', 'name slug')
 
     if(!product){
         throw new AppError('Product not found', 404)
@@ -74,6 +84,11 @@ const getProductBySlug = async (slug) => {
 }
 
 const updateProduct = async (id, updateData) => {
+
+    // if name is being updated, regenerate slug
+    if (updateData.name) {
+        updateData.slug = slugify(updateData.name)
+    }
     
     const product = await Product.findByIdAndUpdate(
         id,
@@ -90,7 +105,7 @@ const updateProduct = async (id, updateData) => {
 }
 
 const deleteProduct = async (id) => {
-    
+
     const product = await Product.findByIdAndUpdate(
         id,
         { isActive: false }  // soft delete
@@ -101,4 +116,31 @@ const deleteProduct = async (id) => {
     }
 }
 
-module.exports = { createProduct, getProducts, getProductBySlug, updateProduct, deleteProduct }
+const uploadProductImage = async(id, fileBuffer, mimetype) => {
+    
+    const product = await Product.findById(id)
+
+    if(!product){
+        throw new AppError('Product not found', 404)
+    }
+
+    const result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+            {folder: 'ecommerce/products'},
+            (error, result) => {
+                if(error){
+                    reject(error)
+                }else{
+                    resolve(result)
+                }
+            }
+        ).end(fileBuffer)
+    })
+
+    product.images.push(result.secure_url)
+    await product.save()
+
+    return product
+}
+
+module.exports = { createProduct, getProducts, getProductBySlug, updateProduct, deleteProduct, uploadProductImage }

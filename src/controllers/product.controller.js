@@ -2,6 +2,8 @@ const asyncHandler = require('../utils/asyncHandler')
 
 const productService = require('../services/product.service')
 
+const AppError = require('../utils/AppError')
+
 const createProduct = asyncHandler( async(req, res) => {
     
     const productData = req.body
@@ -67,4 +69,23 @@ const deleteProduct = asyncHandler( async(req, res) => {
     })
 })
 
-module.exports = { createProduct, getProducts, getProductBySlug, updateProduct, deleteProduct }
+const uploadProductImage = asyncHandler( async(req, res) => {
+
+    // req.file comes from multer middleware
+    if(!req.file){
+        throw new AppError('No image provided', 400)
+    }
+
+    const result = await productService.uploadProductImage(
+        req.params.id,
+        req.file.buffer,
+        req.file.mimetype
+    )
+
+    res.status(200).json({
+        success: true,
+        data: result
+    })
+})
+
+module.exports = { createProduct, getProducts, getProductBySlug, updateProduct, deleteProduct, uploadProductImage }
