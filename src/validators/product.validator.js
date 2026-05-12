@@ -6,7 +6,10 @@ const createProductSchema = z.object({
     price: z.coerce.number().positive(),
     quantity: z.coerce.number().int().min(0),
     category: z.string().length(24, 'Invalid category ID'),
-    attributes: z.record(z.any()).optional()
+    attributes: z.array(z.object({
+        key: z.string(),
+        value: z.any()
+    })).optional()
 })
 
 module.exports = { createProductSchema }

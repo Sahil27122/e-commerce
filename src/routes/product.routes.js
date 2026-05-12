@@ -18,6 +18,8 @@ router.post('/', protect, authorize('ADMIN'), validate(createProductSchema), pro
 
 router.get('/', productController.getProducts)
 
+router.get('/filters', productController.getProductFilters)
+
 router.get('/:slug', productController.getProductBySlug)
 
 router.put('/:id', protect, authorize('ADMIN'), productController.updateProduct)

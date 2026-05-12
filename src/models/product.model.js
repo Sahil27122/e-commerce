@@ -29,18 +29,31 @@ const productSchema = new mongoose.Schema({
         ref: 'Category',
         required: true
     },
-    attributes: {
-        type: mongoose.Schema.Types.Mixed  // accepts any structure
-    },
+    categoryPath: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Category'
+    }],
+    attributes: [{
+        key: {
+            type: String,
+            required: true
+        },
+        value: {
+            type: mongoose.Schema.Types.Mixed,
+            required: true
+        },
+        _id: false
+    }],
     isActive: {
         type: Boolean,
         default: true
     }
 
-}, {timestamps: true})
+}, { timestamps: true })
 
-productSchema.index({ isActive: 1, category: 1, price: 1 })
-productSchema.index({ isActive: 1, category: 1 })
+productSchema.index({ 'attributes.key': 1, 'attributes.value': 1 })
+productSchema.index({ isActive: 1, categoryPath: 1, price: 1 })
+productSchema.index({ isActive: 1, price: 1 })
 
 const Product = mongoose.model('Product', productSchema)
 

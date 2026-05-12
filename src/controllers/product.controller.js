@@ -29,6 +29,18 @@ const getProducts = asyncHandler( async(req, res) => {
     
 })
 
+const getProductFilters = asyncHandler( async(req, res) => {
+
+    const filters = req.query
+
+    const result = await productService.getProductFilters(filters)
+
+    res.status(200).json({
+        success: true,
+        data: result
+    })
+})
+
 const getProductBySlug = asyncHandler( async(req, res) => {
     
     const slug = req.params.slug
@@ -88,4 +100,4 @@ const uploadProductImage = asyncHandler( async(req, res) => {
     })
 })
 
-module.exports = { createProduct, getProducts, getProductBySlug, updateProduct, deleteProduct, uploadProductImage }
+module.exports = { createProduct, getProducts, getProductFilters, getProductBySlug, updateProduct, deleteProduct, uploadProductImage }
