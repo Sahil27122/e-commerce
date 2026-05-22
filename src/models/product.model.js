@@ -47,6 +47,10 @@ const productSchema = new mongoose.Schema({
     isActive: {
         type: Boolean,
         default: true
+    },
+    isSeeded: {
+    type: Boolean,
+    default: false
     }
 
 }, { timestamps: true })

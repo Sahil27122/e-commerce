@@ -14,12 +14,12 @@ const buildCategoryChain = async (categoryId) => {
     let current = await Category.findById(categoryId)
 
     while (current) {
-        
+
         chain.push(current._id)
 
-        if(!current.parent){
+        if (!current.parent) {
             break;
-        }else{
+        } else {
             current = await Category.findById(current.parent)
         }
 
@@ -61,8 +61,8 @@ const getProducts = async (filters) => {
     const query = { isActive: true }
 
     if (category) {
-        query.categoryPath = { 
-            $in: [new mongoose.Types.ObjectId(category)] 
+        query.categoryPath = {
+            $in: [new mongoose.Types.ObjectId(category)]
         }
     }
 
@@ -70,14 +70,21 @@ const getProducts = async (filters) => {
         query.name = { $regex: search, $options: 'i' }
     }
 
-    if(minPrice || maxPrice){
+    if (minPrice && isNaN(Number(minPrice))) {
+        throw new AppError('minPrice must be a number', 400)
+    }
+    if (maxPrice && isNaN(Number(maxPrice))) {
+        throw new AppError('maxPrice must be a number', 400)
+    }
+
+    if (minPrice || maxPrice) {
         query.price = {}
 
-        if(minPrice){
+        if (minPrice) {
             query.price.$gte = Number(minPrice)
         }
 
-        if(maxPrice){
+        if (maxPrice) {
             query.price.$lte = Number(maxPrice)
         }
     }
@@ -91,10 +98,13 @@ const getProducts = async (filters) => {
         }
     }
 
-    const skip = (page - 1) * limit
+    const pageNum = Math.max(1, Number(page))  // minimum page is 1
+    const skip = (pageNum - 1) * limit
+
+    const limitNum = Math.min(Number(limit), 50)  // max 50 per page
 
     const [products, total] = await Promise.all([
-        Product.find(query).populate('category', 'name slug').skip(skip).limit(Number(limit)),
+        Product.find(query).populate('category', 'name slug').skip(skip).limit(limitNum),
         Product.countDocuments(query)
     ])
 
@@ -103,8 +113,8 @@ const getProducts = async (filters) => {
         products,
         pagination: {
             total,
-            page: Number(page),
-            limit: Number(limit),
+            page: pageNum,
+            limit: limitNum,
             totalPages: Math.ceil(total / limit)
         }
     }
@@ -120,11 +130,13 @@ const getProductFilters = async (filters) => {
 
     const matchStage = { isActive: true }
 
-    if(category){
-        matchStage.categoryPath = { 
-            $in: [new mongoose.Types.ObjectId(category)] 
-        }
+    if (!mongoose.Types.ObjectId.isValid(category)) {
+        throw new AppError('Invalid category ID', 400)
     }
+
+    matchStage.categoryPath = {
+            $in: [new mongoose.Types.ObjectId(category)]
+        }
 
     const result = await Product.aggregate([
 
@@ -147,7 +159,7 @@ const getProductFilters = async (filters) => {
             }
         },
 
-        { $sort: {key: 1} }
+        { $sort: { key: 1 } }
 
     ])
 
@@ -159,7 +171,7 @@ const getProductBySlug = async (slug) => {
 
     const product = await Product.findOne({ slug }).populate('category', 'name slug')
 
-    if(!product){
+    if (!product) {
         throw new AppError('Product not found', 404)
     }
 
@@ -172,15 +184,15 @@ const updateProduct = async (id, updateData) => {
     if (updateData.name) {
         updateData.slug = slugify(updateData.name)
     }
-    
+
     const product = await Product.findByIdAndUpdate(
         id,
         updateData,
-        {new: true} 
+        { new: true }
         // returns updated document, not original
     )
 
-    if(!product){
+    if (!product) {
         throw new AppError('Product not found', 404)
     }
 
@@ -194,26 +206,26 @@ const deleteProduct = async (id) => {
         { isActive: false }  // soft delete
     )
 
-    if(!product){
+    if (!product) {
         throw new AppError('Product not found', 404)
     }
 }
 
-const uploadProductImage = async(id, fileBuffer, mimetype) => {
-    
+const uploadProductImage = async (id, fileBuffer, mimetype) => {
+
     const product = await Product.findById(id)
 
-    if(!product){
+    if (!product) {
         throw new AppError('Product not found', 404)
     }
 
     const result = await new Promise((resolve, reject) => {
         cloudinary.uploader.upload_stream(
-            {folder: 'ecommerce/products'},
+            { folder: 'ecommerce/products' },
             (error, result) => {
-                if(error){
+                if (error) {
                     reject(error)
-                }else{
+                } else {
                     resolve(result)
                 }
             }
