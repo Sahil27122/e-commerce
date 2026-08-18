@@ -5,12 +5,20 @@ const crypto = require('crypto')
 
 const AppError = require('../utils/AppError')
 
+const jwt = require('jsonwebtoken')
+
+const { redisClient } = require('../config/redis')
+
 const {generateAccessToken, generateRefreshToken} = require('../utils/tokenUtils')
 const { id } = require('zod/locales')
 
+const transporter = require('../config/mailer')
+
 const register = async(name, email, password) => {
+
+    const emailLower = email.toLowerCase()
     
-    const existingUser = await prisma.user.findUnique({where:{email}})
+    const existingUser = await prisma.user.findUnique({where:{email: emailLower}})
 
     if(existingUser){
         throw new AppError('Email already registered', 409)
@@ -22,19 +30,86 @@ const register = async(name, email, password) => {
     const user = await prisma.user.create({
         data:{
             name,
-            email,
+            email: emailLower,
             password: hashedPassword
         }
     })
+
+    try {
+        await sendOtp(user.email)
+    } catch (err) {
+        console.error('OTP email failed after register:', err.message)
+    }
    
     const{password: _, ...userWithoutPassword} = user
 
     return userWithoutPassword
 }
 
+const sendOtp = async(email) => {
+
+    const emailLower = email.toLowerCase()
+
+    const user = await prisma.user.findUnique({where:{email: emailLower}})
+
+    if(!user){
+        return
+    }
+
+    if(user.isVerified){
+        throw new AppError('Already verified', 400)
+    }
+
+    const otp = crypto.randomInt(100000, 999999).toString()
+
+    const hashedOtp = crypto
+        .createHash('sha256')
+        .update(otp)
+        .digest('hex')
+
+    await redisClient.set('otp:' + emailLower, hashedOtp, {EX: 600})
+
+    await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: emailLower,
+        subject: 'Your verification code',
+        text: `Your OTP is ${otp}. It expires in 10 minutes.`
+    })
+}
+
+const verifyOtp = async(email, otp) => {
+
+    const emailLower = email.toLowerCase()
+
+    const storedHash = await redisClient.get('otp:' + emailLower)
+
+    if(!storedHash){
+        throw new AppError('OTP expired or not found', 400)
+    }
+
+    const hashedOtp = crypto
+        .createHash('sha256')
+        .update(otp)
+        .digest('hex')
+
+    if (hashedOtp !== storedHash) {
+        throw new AppError('Invalid OTP', 400)
+    }
+
+    const user = await prisma.user.update({
+        where: { email: emailLower },
+        data: { isVerified: true }
+    })
+
+    await redisClient.del('otp:' + emailLower)
+
+    const { password: _, ...userWithoutPassword } = user
+    return userWithoutPassword
+}
+
 const login = async(email, password) => {
     
-    const user = await prisma.user.findUnique({where: {email}})
+    const user = await prisma.user.findUnique({where: {email: email.toLowerCase()}})
 
     if(!user){
         throw new AppError('Invalid credentials', 401)
@@ -132,7 +207,7 @@ const refreshAccessToken = async (rawToken) => {
     return {accessToken, refreshToken: newRefreshToken}
 }
 
-const logout = async (rawToken) => {
+const logout = async (rawToken, accessToken) => {
     
     const hashedToken = crypto
     .createHash('sha256')
@@ -147,7 +222,18 @@ const logout = async (rawToken) => {
 
     await prisma.refreshToken.delete({where: {id: tokenRecord.id}})
 
-    
+    // Blacklisting Access Token
+    const hashedAccess = crypto
+    .createHash('sha256')
+    .update(accessToken)
+    .digest('hex')
+
+    const decoded = jwt.decode(accessToken)
+    const ttl = decoded.exp - Math.floor(Date.now() / 1000)
+
+    if (ttl > 0) {
+        await redisClient.set('bl:' + hashedAccess, '1', { EX: ttl })
+    }
 }
 
-module.exports = {register, login, getMe, refreshAccessToken, logout}
+module.exports = {register, login, getMe, refreshAccessToken, logout, sendOtp, verifyOtp}

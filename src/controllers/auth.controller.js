@@ -15,6 +15,27 @@ const register = asyncHandler(async (req, res) => {
     });
 })
 
+const sendOtp = asyncHandler( async(req, res) => {
+    const {email} = req.body;
+
+    await authService.sendOtp(email)
+
+    res.status(200).json({
+        success: true
+    })
+})
+
+const verifyOtp = asyncHandler( async(req, res) => {
+    const {email, otp} = req.body;
+
+    const user = await authService.verifyOtp(email, otp)
+
+    res.status(200).json({
+        success: true,
+        data: user
+    })
+})
+
 const login = asyncHandler(async (req, res) => {
     const {email, password} = req.body;
     const result = await authService.login(email, password);
@@ -66,6 +87,8 @@ const refresh = asyncHandler(async (req, res) => {
 })
 
 const logout = asyncHandler(async (req, res) => {
+
+    const accessToken = req.headers.authorization.split(' ')[1]
     
     const rawToken = req.cookies.refreshToken
 
@@ -73,7 +96,7 @@ const logout = asyncHandler(async (req, res) => {
         throw new AppError('No refresh token provided', 401)
     }
 
-    await authService.logout(rawToken)
+    await authService.logout(rawToken, accessToken)
 
     res.clearCookie('refreshToken')
 
@@ -82,4 +105,4 @@ const logout = asyncHandler(async (req, res) => {
     })
 })
 
-module.exports = { register, login, me, refresh, logout }
+module.exports = { register, login, me, refresh, logout, sendOtp, verifyOtp }
