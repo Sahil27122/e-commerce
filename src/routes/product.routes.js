@@ -4,6 +4,8 @@ const router = express.Router()
 
 const { protect } = require('../middlewares/auth.middleware')
 
+const { publicLimiter } = require('../middlewares/rateLimit')
+
 const { authorize } = require('../middlewares/authorize')
 
 const upload = require('../middlewares/upload')
@@ -16,11 +18,11 @@ const productController = require('../controllers/product.controller')
 
 router.post('/', protect, authorize('ADMIN'), validate(createProductSchema), productController.createProduct)
 
-router.get('/', productController.getProducts)
+router.get('/', publicLimiter, productController.getProducts)
 
-router.get('/filters', productController.getProductFilters)
+router.get('/filters', publicLimiter, productController.getProductFilters)
 
-router.get('/:slug', productController.getProductBySlug)
+router.get('/:slug', publicLimiter, productController.getProductBySlug)
 
 router.put('/:id', protect, authorize('ADMIN'), productController.updateProduct)
 

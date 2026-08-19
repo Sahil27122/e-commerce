@@ -1,7 +1,5 @@
 require('dotenv').config()
 
-const app = require('./src/app')
-
 const connectMongoDB = require('./src/config/mongoose')
 
 const {connectRedis} = require('./src/config/redis')
@@ -12,6 +10,7 @@ Promise.all([
     connectMongoDB(),
     connectRedis()
 ]).then(() => {
+    const app = require('./src/app')
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`)
     })

@@ -8,12 +8,14 @@ const { addToCartSchema } = require('../validators/cart.validator')
 
 const {protect} = require('../middlewares/auth.middleware')
 
-router.post('/add', protect, validate(addToCartSchema), cartController.addToCart)
+const { cartLimiter } = require('../middlewares/rateLimit')
 
-router.get('/', protect, cartController.getCart)
+router.post('/add', protect, cartLimiter, validate(addToCartSchema), cartController.addToCart)
 
-router.delete('/items/:id', protect, cartController.removeItem)
+router.get('/', protect, cartLimiter, cartController.getCart)
 
-router.delete('/', protect, cartController.clearCart)
+router.delete('/items/:id', protect, cartLimiter, cartController.removeItem)
+
+router.delete('/', protect, cartLimiter, cartController.clearCart)
 
 module.exports = router

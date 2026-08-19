@@ -4,6 +4,8 @@ const router = express.Router();
 
 const {protect} = require('../middlewares/auth.middleware')
 
+const { publicLimiter } = require('../middlewares/rateLimit')
+
 const {authorize} = require('../middlewares/authorize')
 
 const upload = require('../middlewares/upload')
@@ -12,9 +14,9 @@ const categoryController = require('../controllers/category.controller')
 
 router.post('/', protect, authorize('ADMIN'), categoryController.createCategory)
 
-router.get('/', categoryController.getCategories)
+router.get('/', publicLimiter, categoryController.getCategories)
 
-router.get('/:slug', categoryController.getCategoryBySlug)
+router.get('/:slug', publicLimiter, categoryController.getCategoryBySlug)
 
 router.put('/:id', protect, authorize('ADMIN'), categoryController.updateCategory)
 
