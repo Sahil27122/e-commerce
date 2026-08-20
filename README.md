@@ -17,9 +17,11 @@ A production-grade, scalable e-commerce REST API built with Node.js, Express, Po
 - [Authentication Flow](#-authentication-flow)
 - [API Reference](#-api-reference)
   - [Auth Module](#auth-module)
+  - [Cart Module](#cart-module)
   - [Product Module](#product-module)
   - [Category Module](#category-module)
 - [Function & Middleware Reference](#-function--middleware-reference)
+- [Rate Limiting](#-rate-limiting)
 - [Database Schema](#-database-schema)
 - [Pagination & Filtering](#-pagination--filtering)
 - [Error Handling](#-error-handling)
@@ -52,8 +54,21 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Refresh tokens stored **hashed** (SHA-256) in PostgreSQL
 - Refresh tokens delivered via **HTTP-only cookies** (XSS protection)
 - Token **rotation** on every refresh (replay attack prevention)
+- Access-token **blacklist in Redis** on logout — stolen Bearer tokens die immediately, not after 15 minutes
+- **Email verification** via 6-digit OTP (Nodemailer + Gmail), hashed in Redis with a 10-minute TTL
+- OTP sent automatically on register; `POST /auth/send-otp` is the resend path
+- Emails stored and looked up **lowercase** — `Sahil@Gmail.com` and `sahil@gmail.com` are the same account
 - **bcrypt** password hashing with configurable salt rounds
 - Role-based access control (`CUSTOMER` | `ADMIN`)
+- **Per-route rate limiting** (Redis-backed) — IP + email counters on auth, IP on public GETs, userId on cart
+
+### Shopping Cart
+- Cart stored in Redis as a **hash** (`cart:<userId>`), not in PostgreSQL or MongoDB
+- `HINCRBY` for atomic “add N more” — two tabs cannot overwrite each other
+- 7-day TTL, refreshed on **writes only** (add / remove), not on GET
+- GET joins Redis quantities with MongoDB for live name/price — cart never stores price as source of truth
+- One Mongo `$in` query for the whole cart (no N+1 `findById` loop)
+- Empty cart is `200` with `items: []`, not 404 — a missing basket is a normal state
 
 ### Product Catalog
 - **Flexible product attributes** — key-value pair system handles any product type (phones have RAM/storage, clothing has size/color)
@@ -73,7 +88,7 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Environment-aware error responses (full stack trace in dev, safe messages in prod)
 
 ### Data Layer
-- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents
+- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents, Redis for cart / OTP / blacklist / rate limits
 - **Prisma ORM** with full migration history
 - **Mongoose** for MongoDB schema enforcement
 - **Compound indexes** on frequently queried field combinations
@@ -93,8 +108,11 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | Runtime | Node.js + Express.js | HTTP server and routing |
 | Primary DB | PostgreSQL + Prisma ORM | Users, refresh tokens (relational, ACID) |
 | Document DB | MongoDB + Mongoose | Product catalog, categories (flexible schema) |
+| Cache / Cart / OTP | Redis (`redis` + `rate-limit-redis`) | Cart hash, OTP, token blacklist, rate-limit counters |
 | Authentication | JWT + bcrypt | Stateless auth with secure password storage |
+| Email | Nodemailer + Gmail App Password | OTP delivery |
 | Validation | Zod | Runtime schema validation |
+| Rate Limiting | express-rate-limit | Per-route limits with Redis store |
 | File Upload | Multer + Cloudinary | Image handling and CDN delivery |
 | Fake Data | @faker-js/faker | Realistic seed data generation |
 
@@ -110,7 +128,7 @@ Route       → URL definition only. No logic.
 Controller  → HTTP coordination only. Calls service, returns response.
 Service     → All business logic. No knowledge of HTTP.
 Model       → Data schema and DB interaction.
-Middleware  → Cross-cutting concerns (auth, validation, role checks).
+Middleware  → Cross-cutting concerns (auth, validation, role checks, rate limits).
 ```
 
 This separation means business logic is fully reusable — callable from REST routes, background jobs, CLI scripts, or tests without any HTTP dependency.
@@ -144,6 +162,33 @@ Hard deleting a category that has historical products would break referential in
 **Why explicit slug generation instead of a Mongoose pre-save hook?**
 Mongoose's `pre('save')` hook only fires on `.save()`, not on `findByIdAndUpdate()` — which this project uses for all updates. Relying on the hook silently fails to regenerate slugs on update. Calling a shared `slugify()` utility explicitly in both `createProduct`/`createCategory` and `updateProduct`/`updateCategory` removes this hidden inconsistency.
 
+**Why Redis for the cart, not Mongo/Postgres?**
+A cart is a shopping basket: written often, allowed to vanish, and not money. Redis hashes give O(1) add/remove of a single product without rewriting the whole document, plus TTL so abandoned carts disappear without a cron job. Orders (Week 5) will live in PostgreSQL because money cannot vanish.
+
+**Why a Redis hash, not one JSON string?**
+A JSON blob is a read-modify-write on every change — two tabs can overwrite each other. `HINCRBY` is atomic: field missing → create at N; field exists → add N.
+
+**Why the cart does not store price?**
+Price is not allowed to go stale. If Redis stored `price: 999` and an admin later set `899`, checkout would charge the wrong amount. Redis holds **productId + quantity** (intent). GET re-reads Mongo for name and price (the shelf tag). Stock is checked at order time, not on add.
+
+**Why SHA-256 for OTP and access-token blacklist, bcrypt for passwords?**
+Passwords are human-chosen and live for years — bcrypt is slow on purpose. OTPs are 6 random digits with a 10-minute TTL; access tokens die in 15 minutes. SHA-256 is instant and matches how refresh tokens are stored. The real OTP defenses are TTL, delete-after-use, and rate limiting — a 6-digit space is brute-forceable offline either way.
+
+**Why two rate-limit counters (IP and email), not one key `ip+email`?**
+A single glued key `1.2.3.4:alice@x.com` treats `1.2.3.4:bob@x.com` as a fresh bucket — one IP can attack unlimited emails. Two counters mean both must pass: this computer cannot hammer, and this inbox cannot be hammered.
+
+**Why empty cart is 200, not 404?**
+`GET /cart` asks “what’s in my basket?” An empty answer is success. 404 would mean the resource does not exist; 400 would mean the client sent a bad request. A new user or a cleared cart is neither.
+
+**Why GET does not refresh cart TTL?**
+TTL means “7 days since they last **changed** the basket.” Opening the cart page, a leftover tab, or a polling frontend is not shopping. If GET reset the timer, abandoned carts would live forever.
+
+**Why lowercase email in the service, not in Zod?**
+Zod is the HTTP door — it only runs on that route. `register` and `sendOtp` can also be called from each other (or later from a job) with no Zod. The service owns how email is stored. Zod only `.trim()`s and checks format.
+
+**Why connect Redis before requiring `app`?**
+`express-rate-limit` + `rate-limit-redis` talk to Redis when the limiter module loads. If `app.js` is required first, Redis is still closed and store init throws `ClientClosedError`. `server.js` runs `connectRedis()` then `require('./src/app')`.
+
 ---
 
 ## 📁 Project Structure
@@ -159,20 +204,25 @@ ecommerce-backend/
 │   ├── config/
 │   │   ├── prisma.js              # Prisma singleton — one connection pool
 │   │   ├── mongoose.js            # MongoDB connection
+│   │   ├── redis.js               # Redis client + connectRedis()
+│   │   ├── mailer.js              # Nodemailer Gmail transporter
 │   │   └── cloudinary.js          # Cloudinary SDK configuration
 │   │
 │   ├── controllers/
 │   │   ├── auth.controller.js
+│   │   ├── cart.controller.js
 │   │   ├── product.controller.js
 │   │   └── category.controller.js
 │   │
 │   ├── services/
 │   │   ├── auth.service.js
+│   │   ├── cart.service.js
 │   │   ├── product.service.js
 │   │   └── category.service.js
 │   │
 │   ├── routes/
 │   │   ├── auth.routes.js
+│   │   ├── cart.routes.js
 │   │   ├── product.routes.js
 │   │   └── category.routes.js
 │   │
@@ -181,14 +231,16 @@ ecommerce-backend/
 │   │   └── category.model.js      # Self-referencing category tree
 │   │
 │   ├── middlewares/
-│   │   ├── auth.middleware.js     # JWT verification — protect routes
+│   │   ├── auth.middleware.js     # JWT verify + Redis blacklist check
 │   │   ├── authorize.js           # Role-based access control
+│   │   ├── rateLimit.js           # Per-route Redis rate limiters
 │   │   ├── upload.js              # Multer — memory storage for Cloudinary
 │   │   ├── validate.js            # Zod schema validation factory
 │   │   └── errorHandler.js        # Global error handler (dev vs prod modes)
 │   │
 │   ├── validators/
 │   │   ├── auth.validator.js      # Zod schemas for auth routes
+│   │   ├── cart.validator.js      # Zod schema for add-to-cart
 │   │   └── product.validator.js   # Zod schemas for product routes
 │   │
 │   ├── utils/
@@ -254,7 +306,17 @@ Authorization: Bearer <access_token>
        │                       │  Hash password        │
        │                       │  Store user           │
        │                       │──────────────────────>│
+       │                       │  SET otp:<email>      │  Redis, 10 min
+       │                       │  Email 6-digit OTP    │
        │  201 { user }         │                       │
+       │<──────────────────────│                       │
+       │                       │                       │
+       │  POST /auth/verify-otp│                       │
+       │──────────────────────>│                       │
+       │                       │  Compare SHA-256 hash │
+       │                       │  isVerified = true    │
+       │                       │  DEL otp:<email>      │
+       │  200 { user }         │                       │
        │<──────────────────────│                       │
        │                       │                       │
        │  POST /auth/login     │                       │
@@ -288,6 +350,15 @@ Authorization: Bearer <access_token>
        │  New accessToken      │                       │
        │  New refreshToken cookie                      │
        │<──────────────────────│                       │
+       │                       │                       │
+       │  POST /auth/logout    │                       │
+       │  Authorization: Bearer <accessToken>          │
+       │──────────────────────>│                       │
+       │                       │  Delete refresh token │
+       │                       │  SET bl:<sha256> TTL=exp-now
+       │  200 { success }      │                       │
+       │<──────────────────────│                       │
+       │  Same access token now fails protect (401 Token revoked)
 ```
 
 ---
@@ -345,12 +416,14 @@ Authorization: Bearer <access_token>
 1. `validate(registerSchema)` middleware runs `schema.safeParse(req.body)` — on failure, throws `AppError` with the first Zod issue message and a `400` status before the controller ever runs
 2. Controller extracts `{ name, email, password }` from `req.body` and calls `authService.register()`
 3. `auth.service.register()`:
-   - Checks for an existing user via `prisma.user.findUnique({ where: { email } })`
+   - Lowercases the email before lookup and insert — `Sahil@Gmail.com` and `sahil@gmail.com` cannot become two accounts
+   - Checks for an existing user via `prisma.user.findUnique({ where: { email: emailLower } })`
    - If found → throws `AppError('Email already registered', 409)`
    - Hashes the password with `bcrypt.hash(password, 10)`
-   - Creates the user via `prisma.user.create()` with the hashed password
+   - Creates the user via `prisma.user.create()` with the hashed password and lowercase email
+   - Calls `sendOtp(user.email)` inside **try/catch** — Gmail failure must not fail register. The user already exists; they resend via `POST /auth/send-otp`
    - Destructures the result to strip `password` before returning (`const { password: _, ...userWithoutPassword } = user`)
-4. Controller responds `201` with the sanitized user object
+4. Controller responds `201` with the sanitized user object (`isVerified: false`). The OTP is **not** in the JSON — only in the email
 
 ---
 
@@ -362,7 +435,7 @@ Authorization: Bearer <access_token>
 |---|---|
 | **Method** | `POST` |
 | **Auth Required** | No |
-| **Middleware Chain** | `validate(loginSchema)` → `login` |
+| **Middleware Chain** | `validate(loginSchema)` → `loginIpLimiter` → `loginEmailLimiter` → `login` |
 
 **Request Body:**
 ```json
@@ -389,11 +462,12 @@ Authorization: Bearer <access_token>
 |---|---|---|
 | 400 | Invalid email format | Zod validation failed |
 | 401 | Invalid credentials | Email not found **or** wrong password — deliberately identical message to prevent user enumeration |
+| 429 | Too many requests | More than 10 login attempts from this IP **or** against this email in 15 minutes |
 
 **Internal Flow:**
 1. Controller extracts `{ email, password }`, calls `authService.login()`
 2. `auth.service.login()`:
-   - Looks up the user by email; if absent → `AppError('Invalid credentials', 401)`
+   - Looks up the user by `email.toLowerCase()`; if absent → `AppError('Invalid credentials', 401)`
    - Compares password with `bcrypt.compare(password, user.password)` (never re-hashes and compares directly — bcrypt salts are random per hash)
    - If mismatch → same `AppError('Invalid credentials', 401)`
    - Generates `accessToken` via `generateAccessToken(user.id, user.role)` — payload carries only `userId` and `role`, **never** email or name, so the token can't go stale if profile fields change
@@ -435,6 +509,7 @@ Authorization: Bearer <access_token>
 | 401 | No token provided | Missing or malformed `Authorization` header |
 | 401 | jwt malformed | Token isn't a valid JWT structure |
 | 401 | jwt expired | Access token past its 15-minute expiry |
+| 401 | Token revoked | Token was blacklisted on logout and is still inside its original 15-minute window |
 
 **Internal Flow:**
 1. `protect` middleware verifies the JWT (see [Function Reference](#protect--srcmiddlewaresauthmiddlewarejs)) and attaches the decoded payload to `req.user`
@@ -507,11 +582,244 @@ Authorization: Bearer <access_token>
 | 401 | Invalid token | Hash not found in DB |
 
 **Internal Flow:**
-1. `protect` confirms the caller holds a valid (not-yet-expired) access token
-2. Controller reads `req.cookies.refreshToken`, hashes it, and calls `authService.logout()`
-3. Service looks up the hash; if missing, throws — otherwise deletes the `RefreshToken` row
-4. Controller calls `res.clearCookie('refreshToken')`
-5. The **access token itself is not invalidated** — it remains technically valid until its 15-minute expiry. This is an accepted tradeoff: short expiry windows make a token blacklist unnecessary for this project's scale
+1. `protect` confirms the caller holds a valid (not-yet-expired, not-blacklisted) access token
+2. Controller reads `req.cookies.refreshToken` and the Bearer access token, then calls `authService.logout(rawToken, accessToken)`
+3. Service looks up the refresh-token hash; if missing, throws — otherwise deletes the `RefreshToken` row
+4. Service SHA-256 hashes the **access** token, reads `exp` via `jwt.decode`, and `SET bl:<hash> '1' EX <seconds left>`. After `exp`, `jwt.verify` already fails — no need to keep the key
+5. Controller calls `res.clearCookie('refreshToken')`
+6. The same Bearer token now fails `protect` with `401 Token revoked` until it would have expired anyway
+
+---
+
+#### POST `/auth/send-otp`
+
+**Purpose:** Send (or resend) a 6-digit email verification code. Also called internally from `register`.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No — the user is not logged in yet |
+| **Middleware Chain** | `validate(sendOtpSchema)` → `otpIpLimiter` → `otpEmailLimiter` → `sendOtp` |
+
+**Request Body:**
+```json
+{
+  "email": "sahil@example.com"
+}
+```
+
+**Success Response (200):**
+```json
+{ "success": true }
+```
+> The OTP is **never** in the JSON. It is emailed only. Redis stores `sha256(otp)`, not the raw code.
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Invalid email format | Zod validation failed |
+| 400 | Already verified | This email's `isVerified` is already `true` |
+| 429 | Too many requests | More than 3 send-otp calls from this IP **or** to this email in 15 minutes |
+
+**Internal Flow:**
+1. Service lowercases the email
+2. Looks up the user. **Not found → return silently.** The controller still sends `200`. A 404 here would let attackers discover which emails are registered (same idea as login's "Invalid credentials")
+3. Already verified → `AppError('Already verified', 400)`
+4. `crypto.randomInt(100000, 999999)` — not `Math.random()`
+5. `SET otp:<email> <sha256(otp)> EX 600`. A second send **overwrites** the key and resets TTL — only one valid code at a time
+6. Nodemailer sends the **raw** 6 digits to that inbox. If `sendMail` throws, the error is not swallowed on this route (register is the one that catches it)
+
+---
+
+#### POST `/auth/verify-otp`
+
+**Purpose:** Confirm the emailed code and set `isVerified: true`.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No |
+| **Middleware Chain** | `validate(verifyOtpSchema)` → `verifyIpLimiter` → `verifyEmailLimiter` → `verifyOtp` |
+
+**Request Body:**
+```json
+{
+  "email": "sahil@example.com",
+  "otp": "482193"
+}
+```
+> `otp` is coerced to a string so a JSON number `482193` still passes.
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "name": "Sahil Sharma",
+    "email": "sahil@example.com",
+    "role": "CUSTOMER",
+    "isVerified": true
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | OTP must be 6 digits | Zod failed (`/^\d{6}$/`) |
+| 400 | OTP expired or not found | Redis key missing (never sent, already used, or past 10 minutes) |
+| 400 | Invalid OTP | Hash of the submitted code does not match Redis |
+| 429 | Too many requests | More than 5 verify attempts from this IP **or** against this email in 15 minutes |
+
+**Internal Flow:**
+1. `GET otp:<emailLower>`. Missing → `400 OTP expired or not found`
+2. SHA-256 the submitted OTP and compare to the stored hash — never compare raw codes
+3. On match: `prisma.user.update({ isVerified: true })`, then `DEL otp:<email>` so the same code cannot be reused
+4. Returns the user without `password`
+
+---
+
+### Cart Module
+
+#### POST `/cart/add`
+
+**Purpose:** Increase a product's quantity in the logged-in user's Redis cart (atomic "add N more", not "set to N").
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `cartLimiter` → `validate(addToCartSchema)` → `addToCart` |
+
+**Request Body:**
+```json
+{
+  "productId": "6a02cddc1a14a5f7638e1337",
+  "quantity": 1
+}
+```
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      { "productId": "6a02cddc1a14a5f7638e1337", "quantity": 2 }
+    ]
+  }
+}
+```
+> Quantity `2` after the same request twice — `HINCRBY`, not a second line.
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 401 | No token provided / jwt expired / Token revoked | `protect` failed |
+| 400 | Invalid product ID | Not a 24-char Mongo ObjectId |
+| 400 | Zod min/max | `quantity` not an integer from 1 to 20 (abuse cap — **not** warehouse stock) |
+| 404 | Product not found | Missing document or `isActive: false` |
+| 429 | Too many requests | More than 60 cart actions from this `userId` in 15 minutes |
+
+**Internal Flow:**
+1. `userId` comes from `req.user` (JWT), **never** from the body
+2. Service loads the product from Mongo. Redis will store any string — a fake id must not become a cart line
+3. `HINCRBY cart:<userId> <productId> <quantity>` — atomic add
+4. `EXPIRE` the key for 7 days (`604800` seconds). A new key has no TTL until this runs
+5. `HGETALL` + `Number(qty)` — Redis hash values are strings (`"2"` not `2`)
+
+Stock is **not** checked here. Cart is intent; inventory is deducted at checkout (Week 5). Zod `max(20)` only stops a request from writing `100000` into Redis.
+
+---
+
+#### GET `/cart`
+
+**Purpose:** Return the cart with live names, prices, line totals, and a grand total.
+
+| Field | Details |
+|---|---|
+| **Method** | `GET` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `cartLimiter` → `getCart` |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "productId": "6a02cddc1a14a5f7638e1337",
+        "name": "OnePlus 12 Pro",
+        "price": 64999,
+        "quantity": 2,
+        "lineTotal": 129998
+      }
+    ],
+    "total": 129998
+  }
+}
+```
+
+**Internal Flow:**
+1. `HGETALL cart:<userId>`. Empty / missing key → `{ items: [], total: 0 }` — **200, not 404**
+2. `Product.find({ _id: { $in: ids }, isActive: true })` — **one** Mongo round trip, not N `findById`s
+3. Build an in-memory map (`_id.toString()` because Redis fields are strings, Mongo `_id` is an ObjectId)
+4. Loop the hash in Redis order. Missing/inactive products are skipped (`continue`), not thrown — the product may have been deleted after it was added
+5. `lineTotal = price * quantity`; `total` is the sum. The frontend must not compute money
+6. GET does **not** refresh TTL
+
+---
+
+#### DELETE `/cart/items/:id`
+
+**Purpose:** Remove that product line entirely (trash-can), regardless of quantity. Decrease-qty (`−` button) is a different future endpoint.
+
+| Field | Details |
+|---|---|
+| **Method** | `DELETE` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `cartLimiter` → `removeItem` |
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 404 | Item not in cart | `HDEL` returned `0` — that field was not in the hash |
+
+**Internal Flow:**
+1. `HDEL cart:<userId> <productId>`. `0` → 404
+2. If the hash is now empty (`Object.keys(fields).length === 0`) → `DEL` the key. `hGetAll` of an empty hash returns `{}`, which is **truthy** in JS — must not use `if (fields)`
+3. If items remain → refresh the 7-day TTL
+4. Returns `getCart(userId)`. After deleting the last item the key is gone; `HGETALL` on a missing key returns `{}` and getCart already treats that as an empty cart
+
+---
+
+#### DELETE `/cart`
+
+**Purpose:** Empty the whole cart. Idempotent — already empty is still `200`.
+
+| Field | Details |
+|---|---|
+| **Method** | `DELETE` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `cartLimiter` → `clearCart` |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": { "items": [], "total": 0 }
+}
+```
+
+**Internal Flow:**
+1. `DEL cart:<userId>` — Redis `DEL` on a missing key is not an error
+2. Return `getCart(userId)` → empty. Clear means “make it empty”; already empty **is** success, unlike remove-one-line which 404s when that line is gone
 
 ---
 
@@ -587,7 +895,7 @@ Authorization: Bearer <access_token>
 |---|---|
 | **Method** | `GET` |
 | **Auth Required** | No (public) |
-| **Middleware Chain** | `getProducts` (no auth/role middleware — public catalog browsing) |
+| **Middleware Chain** | `publicLimiter` → `getProducts` (no auth — public catalog browsing, 100 req / 15 min per IP) |
 
 **Query Parameters:**
 
@@ -829,6 +1137,7 @@ Authorization: Bearer <access_token>
 |---|---|
 | **Method** | `GET` |
 | **Auth Required** | No (public) |
+| **Middleware Chain** | `publicLimiter` → `getCategories` |
 
 **Query Parameters:**
 
@@ -948,10 +1257,12 @@ Authorization: Bearer <access_token>
 | **Output** | User object without the `password` field |
 
 **Internal Logic:**
-1. `prisma.user.findUnique({ where: { email } })` — if a row exists, throws `AppError('Email already registered', 409)`
-2. `bcrypt.hash(password, 10)` — 10 salt rounds, the standard balance between brute-force resistance and login latency
-3. `prisma.user.create()` with the hashed password
-4. `const { password: _, ...userWithoutPassword } = user` — destructures the password into a discarded `_` variable (a common JS convention for "I am intentionally ignoring this") because `password` was already a function parameter name and can't be redeclared with `const` in the same scope
+1. `emailLower = email.toLowerCase()` — service owns storage shape; Zod only trims and checks format
+2. `prisma.user.findUnique({ where: { email: emailLower } })` — if a row exists, throws `AppError('Email already registered', 409)`
+3. `bcrypt.hash(password, 10)` — 10 salt rounds, the standard balance between brute-force resistance and login latency
+4. `prisma.user.create()` with the hashed password and lowercase email
+5. `try { await sendOtp(user.email) } catch` — user row is already committed; a Gmail `535` must not turn into a failed register and a `409` on retry
+6. `const { password: _, ...userWithoutPassword } = user` — destructures the password into a discarded `_` variable (a common JS convention for "I am intentionally ignoring this") because `password` was already a function parameter name and can't be redeclared with `const` in the same scope
 
 ---
 
@@ -988,16 +1299,86 @@ Authorization: Bearer <access_token>
 
 ---
 
-### `auth.service.logout(rawToken)`
+### `auth.service.logout(rawToken, accessToken)`
 
 | Detail | Value |
 |---|---|
 | **File** | `src/services/auth.service.js` |
 
 **Internal Logic:**
-1. Hashes the incoming token, looks it up
+1. Hashes the incoming **refresh** token, looks it up
 2. Not found → `AppError('Invalid token', 401)` — this check happens **before** any delete call (an earlier version of this function called `delete()` before checking existence, which crashed on `null`)
-3. Deletes the matching `RefreshToken` row — the access token is left to expire naturally rather than being explicitly blacklisted, an accepted tradeoff given its 15-minute lifetime
+3. Deletes the matching `RefreshToken` row
+4. SHA-256 hashes the **access** token (same reason refresh tokens are hashed: a Redis `KEYS bl:*` dump must not be a usable Bearer token)
+5. `jwt.decode(accessToken)` only to read `exp` — `protect` already verified the signature
+6. `ttl = decoded.exp - now` (seconds). `ttl > 0` → `SET bl:<hash> '1' EX ttl`. A fixed 15-minute TTL would keep a token that had 30 seconds left around for another 15 minutes
+
+---
+
+### `auth.service.sendOtp(email)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/auth.service.js` |
+
+**Internal Logic:**
+1. Lowercase email, find user. Missing user → `return` (HTTP still 200)
+2. `isVerified` → `400 Already verified`
+3. `crypto.randomInt(100000, 999999).toString()`
+4. Store `sha256(otp)` at `otp:<email>` with `EX 600`
+5. Email the raw OTP via the shared Nodemailer transporter in `src/config/mailer.js`
+
+---
+
+### `auth.service.verifyOtp(email, otp)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/auth.service.js` |
+| **Output** | User object without `password`, `isVerified: true` |
+
+**Internal Logic:**
+1. `GET otp:<email>` — missing means expired, never sent, or already used
+2. Hash the submitted code the same way send did; string-compare hashes
+3. `prisma.user.update({ isVerified: true })` then `DEL` the Redis key — delete **after** success so a crash mid-update can still be retried with the same code
+
+---
+
+### `cart.service.addToCart(userId, productId, quantity)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/cart.service.js` |
+| **Output** | `{ items: [{ productId, quantity }] }` |
+
+**Internal Logic:**
+1. Mongo `findById` — inactive/missing → 404
+2. `HINCRBY cart:<userId> productId quantity` — “add N more”, atomic
+3. `EXPIRE` 7 days
+4. `HGETALL` + `Number(qty)` because Redis hash values are strings
+
+---
+
+### `cart.service.getCart(userId)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/cart.service.js` |
+| **Output** | `{ items: [{ productId, name, price, quantity, lineTotal }], total }` |
+
+**Internal Logic:**
+1. Empty hash → `{ items: [], total: 0 }`
+2. `Product.find({ _id: { $in: ids }, isActive: true })` — one query
+3. Map keyed by `_id.toString()` so Redis string fields match
+4. Skip ids that are not in the map (deleted/inactive after add)
+
+---
+
+### `cart.service.removeItem(userId, productId)` / `clearCart(userId)`
+
+**removeItem:** `HDEL` → 0 means 404. Empty hash → `DEL` the key (must use `Object.keys(fields).length`, not `if (fields)`). Remaining items → refresh TTL. Then `getCart`.
+
+**clearCart:** `DEL cart:<userId>` then `getCart`. Missing key is fine — already empty is success.
 
 ---
 
@@ -1048,7 +1429,8 @@ Authorization: Bearer <access_token>
 1. Reads `req.headers.authorization`; missing or not prefixed with `"Bearer "` → `AppError('No token provided', 401)`
 2. `authHeader.split(' ')[1]` — splitting `"Bearer <token>"` on the space character produces `["Bearer", "<token>"]`; index `1` is the token itself
 3. `jwt.verify(token, process.env.ACCESS_TOKEN_SECRET)` — throws `TokenExpiredError` or `JsonWebTokenError` on failure, both caught by the `asyncHandler` wrapper and forwarded to `errorHandler`
-4. On success, `req.user = decoded` (contains `userId` and `role`) and calls `next()`
+4. On success, SHA-256 the raw token and `EXISTS bl:<hash>`. Hit → `AppError('Token revoked', 401)`. Order: **verify first** (garbage JWTs never hit Redis), then blacklist
+5. `req.user = decoded` (contains `userId` and `role`) and calls `next()`
 
 ---
 
@@ -1172,6 +1554,32 @@ const generateRefreshToken = (userId) =>
 
 ---
 
+## ⏱ Rate Limiting
+
+All counters live in Redis (`rate-limit-redis`) so two Node processes share one count. In-memory limits would reset on restart and double under two instances.
+
+Each limiter is a **named export** (`loginIpLimiter`, `otpEmailLimiter`, …) — two checks on a route are two middlewares you can see, not a factory.
+
+| Policy | Identity | Limit / 15 min | Applied on |
+|--------|----------|----------------|------------|
+| Login | IP **and** email (two counters) | 10 each | `POST /auth/login` |
+| OTP send | IP **and** email | 3 each | `POST /auth/send-otp` |
+| OTP verify | IP **and** email | 5 each | `POST /auth/verify-otp` |
+| Public | IP only | 100 | `GET /products`, `GET /products/filters`, `GET /products/:slug`, `GET /categories`, `GET /categories/:slug` |
+| Cart | `userId` (after `protect`) | 60 | All `/cart` routes |
+
+`protect` **before** `cartLimiter` — there is no `userId` until the JWT is verified.
+
+Auth order: `validate` → limiter → controller, so email exists for the email counter.
+
+IP-only limiters omit a custom `keyGenerator`. Passing `(req) => req.ip` throws `ERR_ERL_KEY_GEN_IPV6` — express-rate-limit's default already handles IPv6.
+
+Over limit → `AppError('Too many requests', 429)`.
+
+Redis prefixes: `rl:login:ip:`, `rl:login:email:`, `rl:otp:ip:`, `rl:otp:email:`, `rl:verify:ip:`, `rl:verify:email:`, `rl:public:ip:`, `rl:cart:user:`.
+
+---
+
 ## 🗄 Database Schema
 
 ### PostgreSQL (via Prisma)
@@ -1182,7 +1590,7 @@ id          String    UUID, Primary Key
 name        String    User's display name
 email       String    Unique
 password    String    bcrypt hashed, never returned in responses
-isVerified  Boolean   Default: false
+isVerified  Boolean   Default: false (flipped to true by POST /auth/verify-otp)
 role        Enum      CUSTOMER | ADMIN, Default: CUSTOMER
 createdAt   DateTime  Auto-set on creation
 updatedAt   DateTime  Auto-updated on every change
@@ -1226,6 +1634,17 @@ parent      ObjectId    Self-reference -> Category (null for top-level)
 isActive    Boolean     Default: true
 ```
 **Relationship:** Self-referencing — a category's `parent` points to another document in the *same* collection, which is what allows arbitrarily nested categories without a separate "Category Tree" model.
+
+### Redis (no schema file — key prefixes are the contract)
+
+| Key | Type | Value | TTL | Purpose |
+|-----|------|-------|-----|---------|
+| `cart:<userId>` | HASH | field = productId, value = quantity | 7 days, refresh on write | Shopping cart |
+| `otp:<email>` | STRING | SHA-256 of the 6-digit code | 10 minutes | Email verification |
+| `bl:<sha256(accessToken)>` | STRING | `1` | remaining JWT lifetime | Access-token denylist |
+| `rl:<policy>:<identity>:*` | STRING | counter (library-managed) | 15 minutes | Rate-limit buckets |
+
+Inspect with Memurai CLI (`memurai-cli` on Windows): `HGETALL cart:<userId>`, `TTL otp:<email>`, `KEYS bl:*`.
 
 ---
 
@@ -1281,11 +1700,12 @@ In development mode, responses also include:
 
 | Status | Type | Examples |
 |--------|------|---------|
-| 400 | Bad Request | Validation failed, invalid ObjectId format, non-numeric price |
+| 400 | Bad Request | Validation failed, invalid ObjectId format, invalid/expired OTP, quantity out of range |
 | 401 | Unauthorized | Missing/expired/invalid token, missing/invalid refresh token |
 | 403 | Forbidden | Authenticated but not `ADMIN` |
 | 404 | Not Found | Product, category, or user doesn't exist |
 | 409 | Conflict | Duplicate email registration |
+| 429 | Too Many Requests | Rate limiter tripped (auth, public, or cart) |
 | 500 | Server Error | Unexpected crash — details hidden in production |
 
 ---
@@ -1296,7 +1716,9 @@ In development mode, responses also include:
 - Node.js v18+
 - PostgreSQL 14+
 - MongoDB 6+
+- Redis (Memurai on Windows works as a drop-in)
 - npm or yarn
+- A Gmail account with 2-Step Verification and an **App Password** (normal Gmail password will get `535 BadCredentials`)
 
 ### 1. Clone the repository
 ```bash
@@ -1329,7 +1751,10 @@ npx prisma migrate dev
 npm run seed
 ```
 
-### 7. Start the server
+### 7. Start Redis
+Memurai (Windows) or `redis-server` must be running on `localhost:6379` before `npm run dev`. Cart, OTP, blacklist, and rate limits all need it. `server.js` connects Redis **before** loading Express so the rate-limit store is not created against a closed client.
+
+### 8. Start the server
 ```bash
 npm run dev       # Development (with hot reload)
 npm start         # Production
@@ -1357,6 +1782,10 @@ REFRESH_TOKEN_EXPIRY=7d
 CLOUDINARY_CLOUD_NAME=your_cloud_name
 CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
+
+# Gmail (OTP) — App Password, 16 characters, no spaces
+EMAIL_USER=youremail@gmail.com
+EMAIL_PASS=abcdefghijklmnop
 ```
 
 Generate secure secrets:
@@ -1423,6 +1852,46 @@ curl -X POST http://localhost:3000/auth/logout \
   -b cookies.txt
 ```
 
+**Send OTP:**
+```bash
+curl -X POST http://localhost:3000/auth/send-otp \
+  -H "Content-Type: application/json" \
+  -d '{"email":"sahil@example.com"}'
+```
+
+**Verify OTP:**
+```bash
+curl -X POST http://localhost:3000/auth/verify-otp \
+  -H "Content-Type: application/json" \
+  -d '{"email":"sahil@example.com","otp":"482193"}'
+```
+
+**Add to cart:**
+```bash
+curl -X POST http://localhost:3000/cart/add \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your_access_token>" \
+  -d '{"productId":"<24_char_mongo_id>","quantity":1}'
+```
+
+**Get cart:**
+```bash
+curl http://localhost:3000/cart \
+  -H "Authorization: Bearer <your_access_token>"
+```
+
+**Remove one cart line:**
+```bash
+curl -X DELETE http://localhost:3000/cart/items/<productId> \
+  -H "Authorization: Bearer <your_access_token>"
+```
+
+**Clear cart:**
+```bash
+curl -X DELETE http://localhost:3000/cart \
+  -H "Authorization: Bearer <your_access_token>"
+```
+
 ---
 
 ## 🧠 What I Learned
@@ -1457,6 +1926,26 @@ curl -X POST http://localhost:3000/auth/logout \
 - **Multer/Express 5 incompatibility** — A multer release candidate broke `memoryStorage` under Express 5 with an "Unexpected end of form" error. Solved by pinning to the LTS release
 - **ObjectId vs string comparison** — Query params arrive as strings, but MongoDB stores ObjectIds. `$in: [category]` never matched until explicitly wrapping with `new mongoose.Types.ObjectId(category)`
 - **Mongoose 7+ async hook syntax** — Pre-save hooks require an `async function()` with no `next` parameter; the older callback style produced a confusing "next is not a function" error
+
+### Week 3 — Redis: Cart, OTP, Blacklist, Rate Limits
+
+**Engineering Concepts:**
+- **Right store for the job** — Cart is intent (Redis hash + TTL). Price and name stay in Mongo. Money will stay in Postgres. Redis here is not a product cache
+- **Atomic hash ops** — `HINCRBY` vs read-modify-write JSON; why add is increment not set
+- **N+1 vs `$in`** — GET cart used to call `findById` per line; one `Product.find({ _id: { $in: ids } })` plus an in-memory map is the same result with one round trip
+- **JWT denylist** — Stateless tokens cannot be unsigned; Redis `bl:<hash>` with TTL = remaining `exp` makes logout actually kill the access token
+- **OTP as a short secret** — SHA-256 + 10 min TTL + delete-after-use + rate limit, not bcrypt
+- **Two rate-limit identities** — IP counter and email counter must both pass; a glued `ip+email` key is not the same thing
+- **Layer ownership** — Zod trims/validates; the service lowercases email so jobs and `register → sendOtp` stay consistent
+
+**Challenges Faced:**
+- **Gmail 535 BadCredentials** — Normal Gmail password is rejected. App Passwords are 16 characters; Google displays them with spaces (`19` chars). SMTP needs the 16 with **no spaces**
+- **Register vs mail failure** — User row is created before `sendMail`. Without try/catch, a 535 made register look like it failed; retry then hit `409`. Catch on register only; resend stays `POST /auth/send-otp`
+- **Email case** — Mixed-case register + lowercased `sendOtp` lookup sent no mail. Service now stores and queries lowercase
+- **Empty hash is truthy** — `hGetAll` after the last `HDEL` returns `{}`. `if (fields)` never deleted the key. Same check as getCart: `Object.keys(fields).length === 0`
+- **`Object.key` vs `Object.keys`** — A missing `s` threw `Object.key is not a function` on remove. The stack pointed at the exact line
+- **Rate-limit store before Redis connect** — Requiring `app` (which loads `rateLimit.js`) before `connectRedis()` threw `ClientClosedError`. `server.js` now connects first, then `require('./src/app')`
+- **ERR_ERL_KEY_GEN_IPV6** — Custom `keyGenerator: (req) => req.ip` is rejected. IP-only limiters use the library default; email/userId keep a custom generator
 
 ---
 
