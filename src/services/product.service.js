@@ -9,6 +9,8 @@ const Category = require('../models/category.model')
 
 const mongoose = require('mongoose')
 
+const { invalidateCache } = require('../utils/cache')
+
 const buildCategoryChain = async (categoryId) => {
     const chain = []
     let current = await Category.findById(categoryId)
@@ -49,6 +51,8 @@ const createProduct = async (productData) => {
         slug,
         attributes
     })
+
+    await invalidateCache('cache:/products')
 
     return product
 }
@@ -196,6 +200,8 @@ const updateProduct = async (id, updateData) => {
         throw new AppError('Product not found', 404)
     }
 
+    await invalidateCache('cache:/products')
+
     return product
 }
 
@@ -209,6 +215,8 @@ const deleteProduct = async (id) => {
     if (!product) {
         throw new AppError('Product not found', 404)
     }
+
+    await invalidateCache('cache:/products')
 }
 
 const uploadProductImage = async (id, fileBuffer, mimetype) => {
@@ -234,6 +242,8 @@ const uploadProductImage = async (id, fileBuffer, mimetype) => {
 
     product.images.push(result.secure_url)
     await product.save()
+
+    await invalidateCache('cache:/products')
 
     return product
 }

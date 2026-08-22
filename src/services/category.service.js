@@ -8,6 +8,8 @@ const slugify = require('../utils/slugify')
 
 const cloudinary = require('../config/cloudinary')
 
+const { invalidateCache } = require('../utils/cache')
+
 const createCategory = async (categoryData) => {
 
     categoryData.slug = slugify(categoryData.name)
@@ -21,6 +23,9 @@ const createCategory = async (categoryData) => {
         parent, 
         image
     })
+
+    await invalidateCache('cache:/categories')
+    await invalidateCache('cache:/products')
 
     return category
 }
@@ -68,6 +73,9 @@ const updateCategory = async (id, updateData) => {
         throw new AppError('Category not found', 404)
     }
 
+    await invalidateCache('cache:/categories')
+    await invalidateCache('cache:/products')
+
     return category
 }
 
@@ -90,6 +98,9 @@ const deleteCategory = async (id) => {
     if(!category){
         throw new AppError('Category not found', 404)
     }
+
+    await invalidateCache('cache:/categories')
+    await invalidateCache('cache:/products')
 }
 
 const uploadCategoryImage = async (id, fileBuffer, memetype) => {
@@ -115,6 +126,9 @@ const uploadCategoryImage = async (id, fileBuffer, memetype) => {
 
     category.image = result.secure_url
     await category.save()
+
+    await invalidateCache('cache:/categories')
+    await invalidateCache('cache:/products')
 
     return category
 }

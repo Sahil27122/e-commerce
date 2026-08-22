@@ -12,9 +12,11 @@ const upload = require('../middlewares/upload')
 
 const categoryController = require('../controllers/category.controller')
 
+const cacheMiddleware = require('../middlewares/cache')
+
 router.post('/', protect, authorize('ADMIN'), categoryController.createCategory)
 
-router.get('/', publicLimiter, categoryController.getCategories)
+router.get('/', publicLimiter, cacheMiddleware(600), categoryController.getCategories)
 
 router.get('/:slug', publicLimiter, categoryController.getCategoryBySlug)
 

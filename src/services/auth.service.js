@@ -121,6 +121,10 @@ const login = async(email, password) => {
         throw new AppError('Invalid credentials', 401)
     }
 
+    if (!user.isVerified) {
+        throw new AppError('Please verify your email', 403)
+    }
+
     const accessToken = generateAccessToken(user.id, user.role);
     const newRefreshToken = generateRefreshToken(user.id);
 

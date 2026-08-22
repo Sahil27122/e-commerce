@@ -16,9 +16,11 @@ const { createProductSchema } = require('../validators/product.validator')
 
 const productController = require('../controllers/product.controller')
 
+const cacheMiddleware = require('../middlewares/cache')
+
 router.post('/', protect, authorize('ADMIN'), validate(createProductSchema), productController.createProduct)
 
-router.get('/', publicLimiter, productController.getProducts)
+router.get('/', publicLimiter, cacheMiddleware(600), productController.getProducts)
 
 router.get('/filters', publicLimiter, productController.getProductFilters)
 
