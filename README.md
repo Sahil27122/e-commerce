@@ -22,6 +22,7 @@ A production-grade, scalable e-commerce REST API built with Node.js, Express, Po
   - [Category Module](#category-module)
 - [Function & Middleware Reference](#-function--middleware-reference)
 - [Rate Limiting](#-rate-limiting)
+- [Response Caching](#-response-caching)
 - [Database Schema](#-database-schema)
 - [Pagination & Filtering](#-pagination--filtering)
 - [Error Handling](#-error-handling)
@@ -79,6 +80,9 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - **Slug auto-generation** — URL-friendly identifiers from product/category names, applied consistently via a shared utility
 - **Soft delete** — categories blocked from deletion if active products exist; products hidden via `isActive` flag
 - **Faker.js seed script** — generates realistic demo data across all categories with one command
+- **GET list caching** — `GET /products` and `GET /categories` cached in Redis for 10 minutes; query string is part of the key so `?page=1` and `?page=2` never share a slot
+- **Cache invalidation on write** — product/category create, update, delete, and image upload delete matching `cache:` keys via `SCAN` (not `KEYS`)
+- **Cache stampede lock** — on a miss, only one request hits Mongo; others wait on a Redis `SET NX` lock then read the new cache
 
 ### Architecture
 - Clean **Route → Controller → Service** separation
@@ -88,7 +92,7 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Environment-aware error responses (full stack trace in dev, safe messages in prod)
 
 ### Data Layer
-- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents, Redis for cart / OTP / blacklist / rate limits
+- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents, Redis for cart / OTP / blacklist / rate limits / GET response cache
 - **Prisma ORM** with full migration history
 - **Mongoose** for MongoDB schema enforcement
 - **Compound indexes** on frequently queried field combinations
@@ -108,7 +112,7 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | Runtime | Node.js + Express.js | HTTP server and routing |
 | Primary DB | PostgreSQL + Prisma ORM | Users, refresh tokens (relational, ACID) |
 | Document DB | MongoDB + Mongoose | Product catalog, categories (flexible schema) |
-| Cache / Cart / OTP | Redis (`redis` + `rate-limit-redis`) | Cart hash, OTP, token blacklist, rate-limit counters |
+| Cache / Cart / OTP | Redis (`redis` + `rate-limit-redis`) | Cart, OTP, blacklist, rate limits, GET response cache, stampede locks |
 | Authentication | JWT + bcrypt | Stateless auth with secure password storage |
 | Email | Nodemailer + Gmail App Password | OTP delivery |
 | Validation | Zod | Runtime schema validation |
@@ -128,7 +132,7 @@ Route       → URL definition only. No logic.
 Controller  → HTTP coordination only. Calls service, returns response.
 Service     → All business logic. No knowledge of HTTP.
 Model       → Data schema and DB interaction.
-Middleware  → Cross-cutting concerns (auth, validation, role checks, rate limits).
+Middleware  → Cross-cutting concerns (auth, validation, role checks, rate limits, response cache).
 ```
 
 This separation means business logic is fully reusable — callable from REST routes, background jobs, CLI scripts, or tests without any HTTP dependency.
@@ -189,6 +193,33 @@ Zod is the HTTP door — it only runs on that route. `register` and `sendOtp` ca
 **Why connect Redis before requiring `app`?**
 `express-rate-limit` + `rate-limit-redis` talk to Redis when the limiter module loads. If `app.js` is required first, Redis is still closed and store init throws `ClientClosedError`. `server.js` runs `connectRedis()` then `require('./src/app')`.
 
+**Why cache in middleware, not in `getProducts`?**
+`cacheMiddleware(ttl)` is the same shape as `validate(schema)`: one function, TTL as the argument, the service never hears about Redis. The list JSON is already what the client needs. Wrapping `res.json` stores that exact envelope without a second mapper.
+
+**Why the cache key includes `req.originalUrl`?**
+`GET /products` and `GET /products?page=2` are different lists. One key `cache:products` would let page 2 overwrite page 1. `cache:${originalUrl}` makes each query string its own entry. Prefix `cache:` so it never collides with `cart:`, `otp:`, `bl:`, `rl:`, or `lock:`.
+
+**Why fail-open if Redis is down?**
+Cache is a speedup, not the source of truth. A `GET` error or a failed `setEx` must still return Mongo. A shop that 500s because Redis restarted is worse than a shop that is merely slower.
+
+**Why only cache `success: true`?**
+After `res.json` is wrapped, the error handler also calls `res.json`. Without the `data.success` check, a 400 would be stored for 10 minutes and every next visitor would get a cached error.
+
+**Why `SCAN` instead of `KEYS` for invalidation?**
+`KEYS cache:/products*` blocks Redis and walks the whole keyspace — cart, OTP, and rate limits wait too. `SCAN` walks in chunks (`COUNT: 100`). The cursor from Redis is a **string** (`"0"`), not the number `0`; comparing to `0` never ends the loop.
+
+**Why invalidate from the service after Mongo succeeds?**
+If create throws, there is nothing new to expose — don't drop a warm cache. If you invalidate before the write, a GET in between refills Redis with the **old** document. Category writes also drop `cache:/products*` because the product list populates category `name` / `slug`.
+
+**Why a Redis lock on cache miss (stampede)?**
+Invalidating (or a cold cache) plus 10 000 concurrent `GET /products` is 10 000 Mongo queries and 10 000 `SET`s — a cache stampede / thundering herd. `SET lock:<url> NX EX 10` lets **one** request rebuild the cache. Others poll Redis briefly, then read the new value.
+
+**Why release the lock inside `res.json`, not after `next()`?**
+Express `next()` does not wait for the controller. `await next()` then `releaseLock` in `finally` drops the lock **before** Mongo finishes, and the waiters all miss again. The lock is released in `res.json`'s `finally` — after `setEx` (or after a failed write / error body). If `res.json` never runs, `EX 10` still frees the lock.
+
+**Why not cache-key versioning?**
+Versioning puts `v5` in the key and invalidates by bumping `v` — old keys expire via TTL, no `SCAN`. Not implemented here: extra leftover keys until TTL, and `SCAN` + prefix delete is enough at this scale. Documented as a known next step, not as shipping code.
+
 ---
 
 ## 📁 Project Structure
@@ -234,6 +265,7 @@ ecommerce-backend/
 │   │   ├── auth.middleware.js     # JWT verify + Redis blacklist check
 │   │   ├── authorize.js           # Role-based access control
 │   │   ├── rateLimit.js           # Per-route Redis rate limiters
+│   │   ├── cache.js               # GET response cache + stampede lock
 │   │   ├── upload.js              # Multer — memory storage for Cloudinary
 │   │   ├── validate.js            # Zod schema validation factory
 │   │   └── errorHandler.js        # Global error handler (dev vs prod modes)
@@ -247,7 +279,8 @@ ecommerce-backend/
 │   │   ├── AppError.js            # Custom error class with status codes
 │   │   ├── asyncHandler.js        # Eliminates try/catch in every controller
 │   │   ├── tokenUtils.js          # JWT generation helpers
-│   │   └── slugify.js             # URL-friendly slug generation
+│   │   ├── slugify.js             # URL-friendly slug generation
+│   │   └── cache.js               # SCAN invalidation + SET NX lock helpers
 │   │
 │   ├── scripts/
 │   │   └── seedProducts.js        # Faker.js seed — realistic demo products
@@ -895,7 +928,7 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 |---|---|
 | **Method** | `GET` |
 | **Auth Required** | No (public) |
-| **Middleware Chain** | `publicLimiter` → `getProducts` (no auth — public catalog browsing, 100 req / 15 min per IP) |
+| **Middleware Chain** | `publicLimiter` → `cacheMiddleware(600)` → `getProducts` (public, 100 req / 15 min per IP, 10-minute Redis cache) |
 
 **Query Parameters:**
 
@@ -1137,7 +1170,7 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 |---|---|
 | **Method** | `GET` |
 | **Auth Required** | No (public) |
-| **Middleware Chain** | `publicLimiter` → `getCategories` |
+| **Middleware Chain** | `publicLimiter` → `cacheMiddleware(600)` → `getCategories` |
 
 **Query Parameters:**
 
@@ -1554,6 +1587,33 @@ const generateRefreshToken = (userId) =>
 
 ---
 
+### `cacheMiddleware(ttl)` — `src/middlewares/cache.js`
+
+| Detail | Value |
+|---|---|
+| **Purpose** | Cache successful GET JSON in Redis; rebuild under a distributed lock on miss |
+| **Input** | `ttl` in **seconds** (lists use `600`) |
+
+**Internal Logic:**
+1. Key = `cache:` + `req.originalUrl` (path + query)
+2. Lock key = `lock:` + `req.originalUrl` — different prefix so `SCAN cache:/products*` never deletes the lock
+3. Cache hit → `JSON.parse` and return `200`
+4. `acquireLock` (`SET NX EX 10` + random UUID). Failure → wait/retry GET; still empty → `next()` without a lock
+5. Success → replace `res.json` (`.bind(res)` so `this` stays the response). `setEx` only when `data.success === true`. `releaseLock` in `finally` so errors still unlock
+6. `next()` is **not** awaited — Express does not return a Promise for the rest of the chain
+
+---
+
+### `acquireLock` / `releaseLock` / `invalidateCache` — `src/utils/cache.js`
+
+**acquireLock:** `SET key token NX EX ttl`. Returns the token or `null`. `NX` is what makes the lock exclusive.
+
+**releaseLock:** `GET` then `DEL` only if the stored value equals this request's token — you must not delete someone else's lock after yours expired. (A Lua compare-and-del is the stricter version at huge scale; GET+DEL is the version in this repo.)
+
+**invalidateCache(prefix):** `SCAN` with `MATCH prefix*` until cursor is `'0'`. `DEL` each batch. Errors are logged, never thrown — a write must not fail because cache cleanup failed.
+
+---
+
 ## ⏱ Rate Limiting
 
 All counters live in Redis (`rate-limit-redis`) so two Node processes share one count. In-memory limits would reset on restart and double under two instances.
@@ -1577,6 +1637,36 @@ IP-only limiters omit a custom `keyGenerator`. Passing `(req) => req.ip` throws 
 Over limit → `AppError('Too many requests', 429)`.
 
 Redis prefixes: `rl:login:ip:`, `rl:login:email:`, `rl:otp:ip:`, `rl:otp:email:`, `rl:verify:ip:`, `rl:verify:email:`, `rl:public:ip:`, `rl:cart:user:`.
+
+---
+
+## 🧊 Response Caching
+
+Public **lists** are cached. Single-product / single-category GETs by slug are not — one Mongo `findOne` is cheap, and the plan called for listings.
+
+| Route | TTL | Redis key example |
+|-------|-----|-------------------|
+| `GET /products` (+ query string) | 600s | `cache:/products`, `cache:/products?page=2` |
+| `GET /categories` (+ query string) | 600s | `cache:/categories`, `cache:/categories?parent=null` |
+
+**Read path (`cacheMiddleware`):**
+1. `GET cache:<originalUrl>` — hit → parse and return, Mongo skipped
+2. Miss → `SET lock:<originalUrl> NX EX 10`
+   - Got the lock → wrap `res.json`, `next()`, controller + Mongo run
+   - No lock → poll Redis 10 × 50ms; if still empty, `next()` (fail-open)
+3. On `res.json`: if `data.success === true`, `setEx` the body; **always** `releaseLock` in `finally`
+4. Redis errors on the outer `GET` → `next(error)` / waiters still fall through to Mongo if the wait loop expires
+
+**Write path (service, after Mongo succeeds):**
+
+| After | Deletes |
+|-------|---------|
+| Product create / update / delete / image | `cache:/products*` |
+| Category create / update / delete / image | `cache:/categories*` **and** `cache:/products*` |
+
+`await invalidateCache(...)` so the HTTP response is not sent while old keys still exist.
+
+Homepage / top-rated lists were **not** added — there is no `rating` field. `GET /products` + `GET /categories` are the homepage payload.
 
 ---
 
@@ -1643,8 +1733,10 @@ isActive    Boolean     Default: true
 | `otp:<email>` | STRING | SHA-256 of the 6-digit code | 10 minutes | Email verification |
 | `bl:<sha256(accessToken)>` | STRING | `1` | remaining JWT lifetime | Access-token denylist |
 | `rl:<policy>:<identity>:*` | STRING | counter (library-managed) | 15 minutes | Rate-limit buckets |
+| `cache:<originalUrl>` | STRING | JSON success envelope | 10 minutes | GET list responses |
+| `lock:<originalUrl>` | STRING | lock owner UUID | 10 seconds | Stampede: only one miss rebuilds the cache |
 
-Inspect with Memurai CLI (`memurai-cli` on Windows): `HGETALL cart:<userId>`, `TTL otp:<email>`, `KEYS bl:*`.
+Inspect with Memurai CLI (`memurai-cli` on Windows): `HGETALL cart:<userId>`, `TTL otp:<email>`, `GET cache:/products`, `KEYS cache:*`.
 
 ---
 
@@ -1946,6 +2038,25 @@ curl -X DELETE http://localhost:3000/cart \
 - **`Object.key` vs `Object.keys`** — A missing `s` threw `Object.key is not a function` on remove. The stack pointed at the exact line
 - **Rate-limit store before Redis connect** — Requiring `app` (which loads `rateLimit.js`) before `connectRedis()` threw `ClientClosedError`. `server.js` now connects first, then `require('./src/app')`
 - **ERR_ERL_KEY_GEN_IPV6** — Custom `keyGenerator: (req) => req.ip` is rejected. IP-only limiters use the library default; email/userId keep a custom generator
+
+### Week 4 — Response Cache, Invalidation, Stampede Lock
+
+**Engineering Concepts:**
+- **Cache-aside** — Redis holds a copy of the GET JSON, not the catalog. Mongo stays source of truth. Miss → Mongo → `setEx`
+- **Key = URL** — query string is part of identity; one global `cache:products` key is a correctness bug
+- **Fail-open** — Redis down still serves the shop; only success bodies are stored
+- **Invalidate after write** — `SCAN` + prefix delete from the service, after Mongo succeeds, `await`ed so the next GET cannot race the old key
+- **SCAN vs KEYS** — `KEYS` blocks the Redis process; `SCAN` is chunked; cursor is a string
+- **Cache stampede** — `SET NX` lock so one miss rebuilds; waiters poll then read. Lock released in `res.json`, not after `next()`
+- **Versioning (not shipped)** — bump a version in the key instead of deleting; old keys die on TTL. Extra memory until expiry; skipped at this scale
+
+**Challenges Faced:**
+- **Middleware not mounted** — `cache.js` existed but `GET /products` did not use it. Redis `GET cache:/products` was `(nil)` until `cacheMiddleware(600)` was on the route
+- **Guessing the Redis key** — Postman URL and `originalUrl` must match. `KEYS cache:*` shows the real key; don't guess `?page=1` if the client omitted it
+- **Caching errors** — wrapped `res.json` also wraps the error handler. Guard with `data.success === true`
+- **`await next()` released the lock too soon** — Express `next()` is not a Promise for the controller. Waiters stampeded. Fix: `releaseLock` in `res.json` `finally`
+- **SCAN infinite loop** — Redis returns cursor `"0"`. `!== 0` is always true for the string `"0"`. Loop until `cursor !== '0'`
+- **Stale product list after category rename** — product GET populates category name. Category writes must also `invalidateCache('cache:/products')`
 
 ---
 
