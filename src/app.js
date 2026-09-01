@@ -10,6 +10,8 @@ const categoryRoutes = require('./routes/category.routes')
 
 const cartRoutes = require('./routes/cart.routes')
 
+const addressRoutes = require('./routes/address.routes')
+
 const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
@@ -26,6 +28,7 @@ app.use('/auth', authRoutes)
 app.use('/products', productRoutes)
 app.use('/categories', categoryRoutes)
 app.use('/cart', cartRoutes)
+app.use('/addresses', addressRoutes)
 
 app.use(errorHandler) // after all routes
 
